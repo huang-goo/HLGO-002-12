@@ -77,6 +77,7 @@ public abstract class AbstractRssReader<C extends Channel, I extends Item> {
     private Duration connectionTimeout = Duration.ofSeconds(25);
     private Duration requestTimeout = Duration.ofSeconds(25);
     private Duration readTimeout = Duration.ofSeconds(25);
+    private RetryPolicy retryPolicy;
     private final Map<String, String> headers = new HashMap<>();
     protected final HashMap<String, Consumer<C>> onChannelTags = new HashMap<>();
     private final HashMap<String, BiConsumer<C, String>> channelTags = new HashMap<>();
@@ -400,6 +401,21 @@ public abstract class AbstractRssReader<C extends Channel, I extends Item> {
         return this;
     }
 
+    /**
+     * Sets the retry policy for HTTP requests.
+     * When a retry policy is set, HTTP requests that fail due to timeouts or 5xx server errors
+     * will be retried with exponential backoff.
+     * If set to null, no retries will be performed.
+     * Default: null (no retries).
+     *
+     * @param retryPolicy the retry policy to use, or null to disable retries.
+     * @return updated RSSReader.
+     */
+    public AbstractRssReader<C, I> setRetryPolicy(RetryPolicy retryPolicy) {
+        this.retryPolicy = retryPolicy;
+        return this;
+    }
+
     private void validate(Duration duration, String name) {
         Objects.requireNonNull(duration, name + " must not be null");
 
@@ -601,6 +617,14 @@ public abstract class AbstractRssReader<C extends Channel, I extends Item> {
      * @return response
      */
     protected CompletableFuture<HttpResponse<InputStream>> sendAsyncRequest(String url) {
+        var request = buildRequest(url);
+        if (retryPolicy == null || retryPolicy.getMaxRetries() <= 0) {
+            return httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofInputStream());
+        }
+        return sendWithRetry(request, 0);
+    }
+
+    private HttpRequest buildRequest(String url) {
         var builder = HttpRequest.newBuilder(URI.create(url))
                 .header("Accept-Encoding", "gzip");
         if (requestTimeout.toMillis() > 0) {
@@ -612,7 +636,72 @@ public abstract class AbstractRssReader<C extends Channel, I extends Item> {
         }
 
         headers.forEach(builder::header);
-        return httpClient.sendAsync(builder.GET().build(), HttpResponse.BodyHandlers.ofInputStream());
+        return builder.GET().build();
+    }
+
+    private CompletableFuture<HttpResponse<InputStream>> sendWithRetry(HttpRequest request, int attempt) {
+        return httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofInputStream())
+                .thenCompose(response -> {
+                    if (response.statusCode() >= 500 && response.statusCode() < 600) {
+                        return retryOrFail(request, attempt, null);
+                    }
+                    return CompletableFuture.completedFuture(response);
+                })
+                .exceptionallyCompose(ex -> retryOrFail(request, attempt, ex));
+    }
+
+    private CompletableFuture<HttpResponse<InputStream>> retryOrFail(HttpRequest request, int attempt, Throwable ex) {
+        if (attempt < retryPolicy.getMaxRetries() && isRetryable(ex)) {
+            var delay = retryPolicy.getDelay(attempt);
+            if (LOGGER.isLoggable(Level.FINE)) {
+                LOGGER.log(Level.FINE, () -> String.format(
+                        "Retry %d/%d after %d ms for URL %s. Reason: %s",
+                        attempt + 1, retryPolicy.getMaxRetries(), delay.toMillis(),
+                        request.uri(), ex != null ? ex.getMessage() : "HTTP 5xx error"));
+            }
+            var future = new CompletableFuture<HttpResponse<InputStream>>();
+            EXECUTOR.schedule(() -> {
+                try {
+                    sendWithRetry(request, attempt + 1).whenComplete((result, error) -> {
+                        if (error != null) {
+                            future.completeExceptionally(error);
+                        } else {
+                            future.complete(result);
+                        }
+                    });
+                } catch (Exception e) {
+                    future.completeExceptionally(e);
+                }
+            }, delay.toMillis(), TimeUnit.MILLISECONDS);
+            return future;
+        }
+        if (ex != null) {
+            return CompletableFuture.failedFuture(ex);
+        }
+        return CompletableFuture.failedFuture(new IOException(
+                String.format("Request failed after %d retries with HTTP 5xx error", retryPolicy.getMaxRetries())));
+    }
+
+    private boolean isRetryable(Throwable ex) {
+        if (ex == null) {
+            return true;
+        }
+        if (ex instanceof CompletionException && ex.getCause() != null) {
+            return isRetryable(ex.getCause());
+        }
+        if (ex instanceof java.net.http.HttpTimeoutException) {
+            return true;
+        }
+        if (ex instanceof java.io.InterruptedIOException) {
+            return true;
+        }
+        if (ex instanceof java.net.SocketTimeoutException) {
+            return true;
+        }
+        if (ex instanceof java.net.ConnectException) {
+            return true;
+        }
+        return false;
     }
 
     private Function<HttpResponse<InputStream>, Stream<I>> processResponse() {
